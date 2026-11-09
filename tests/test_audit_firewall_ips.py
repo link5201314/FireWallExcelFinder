@@ -264,7 +264,8 @@ def test_writes_csv_matches_while_printing_summary_to_console(
     assert result.returncode == 0, result.stderr
     assert "有效目標規則行數：1" in result.stdout
     assert "rules.xlsx" not in result.stdout
-    with output.open(encoding="utf-8", newline="") as report_file:
+    assert output.read_bytes().startswith(b"\xef\xbb\xbf")
+    with output.open(encoding="utf-8-sig", newline="") as report_file:
         rows = list(csv.DictReader(report_file))
     assert len(rows) == 1
     assert rows[0]["file"] == "rules.xlsx"
@@ -285,7 +286,7 @@ def test_csv_report_distinguishes_same_filename_in_different_directories(
     )
 
     assert result.returncode == 0, result.stderr
-    with output.open(encoding="utf-8", newline="") as report_file:
+    with output.open(encoding="utf-8-sig", newline="") as report_file:
         rows = list(csv.DictReader(report_file))
     assert {row["file"] for row in rows} == {"east/rules.xlsx", "west/rules.xlsx"}
 

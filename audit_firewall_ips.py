@@ -402,8 +402,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with ExitStack() as resource_stack:
             if arguments.output is not None:
+                report_encoding = "utf-8-sig" if output_format == ".csv" else "utf-8"
                 opened_output = resource_stack.enter_context(
-                    arguments.output.open("w", encoding="utf-8", newline="")
+                    arguments.output.open(
+                        "w", encoding=report_encoding, newline=""
+                    )
                 )
                 output_stream = opened_output
                 if output_format == ".csv":

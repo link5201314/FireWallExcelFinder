@@ -14,6 +14,8 @@ uv run python audit_firewall_ips.py --dir .\excel --target .\targets.txt --recur
 
 目標檔每行一條規則，空白行及以 `#` 開頭的整行會忽略。格式錯誤的目標行會警告後略過。未指定報告檔時，命中明細與摘要輸出至 Console；指定 `.txt` 或 `.csv` 報告時，摘要仍輸出至 Console。加上 `--verbose` 可顯示命中儲存格的完整文字；預設只掃描指定目錄第一層，加上 `--recursive` 才會掃描子目錄。
 
+CSV 報告使用帶 UTF-8 BOM 的編碼，方便在 Windows 上直接以 Excel 開啟並正確顯示中文字元。
+
 目標規則範例：
 
 ```text

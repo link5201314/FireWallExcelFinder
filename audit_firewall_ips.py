@@ -10,6 +10,7 @@ import re
 import sys
 import xml.etree.ElementTree as element_tree
 import zipfile
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, TextIO
@@ -21,7 +22,7 @@ from openpyxl.utils.exceptions import InvalidFileException
 LOGGER = logging.getLogger(__name__)
 IPV4_SOURCE = r"(?:\d{1,3}\.){3}\d{1,3}"
 TOKEN_PATTERNS = (
-    re.compile(rf"(?<![\w.]){IPV4_SOURCE}/\d{{1,2}}(?![\w.])"),
+    re.compile(rf"(?<![\w.]){IPV4_SOURCE}/\d+(?![\w.])"),
     re.compile(rf"(?<![\w.]){IPV4_SOURCE}-{IPV4_SOURCE}(?![\w.])"),
     re.compile(rf"(?<![\w.]){IPV4_SOURCE}-\d{{1,3}}(?![\w.])"),
     re.compile(rf"(?<![\w.]){IPV4_SOURCE}(?![\w.])"),
@@ -69,7 +70,7 @@ class AddressToken:
 class MatchRecord:
     """可追溯至活頁簿儲存格的命中紀錄。"""
 
-    file_path: Path
+    file_name: str
     target: TargetRule
     token: str
     sheet: str
@@ -170,7 +171,7 @@ def load_target_rules(target_path: Path) -> list[TargetRule]:
         except ValueError as error:
             LOGGER.warning("目標檔第 %s 行格式錯誤，已略過：%s（%s）", line_number, expression, error)
             continue
-        rules.append(TargetRule(expression, line_number, interval))
+        rules.append(TargetRule(raw_line, line_number, interval))
     return rules
 
 
@@ -207,12 +208,14 @@ def intervals_overlap(first: AddressInterval, second: AddressInterval) -> bool:
 
 def discover_workbooks(directory: Path, recursive: bool) -> tuple[list[Path], bool]:
     """列出符合範圍的 Excel 活頁簿並略過符號連結。"""
-    if directory.is_symlink():
-        raise InputError(f"掃描目錄不可為符號連結：{directory}")
+    absolute_directory = directory.absolute()
+    path_components = (absolute_directory, *absolute_directory.parents)
+    if any(component.is_symlink() for component in path_components):
+        raise InputError(f"掃描目錄路徑不可包含符號連結：{directory}")
     if not directory.exists() or not directory.is_dir():
         raise InputError(f"掃描目錄不存在或不是目錄：{directory}")
 
-    root = directory.resolve()
+    root = absolute_directory
     pending_directories = [root]
     workbooks: list[Path] = []
     partial_failure = False
@@ -266,12 +269,12 @@ def worksheet_matches(sheet_name: str, keywords: list[str] | None) -> bool:
 
 def scan_workbook(
     workbook_path: Path,
+    scan_root: Path,
     targets: list[TargetRule],
     sheet_keywords: list[str] | None,
 ) -> Iterator[MatchRecord]:
     """以唯讀模式逐格掃描活頁簿並產生命中紀錄。"""
-    workbook = load_workbook(workbook_path, read_only=True, data_only=True)
-    try:
+    with closing(load_workbook(workbook_path, read_only=True, data_only=True)) as workbook:
         for worksheet in workbook.worksheets:
             if not worksheet_matches(worksheet.title, sheet_keywords):
                 continue
@@ -279,14 +282,14 @@ def scan_workbook(
                 for column_number, value in enumerate(row, start=1):
                     if value is None:
                         continue
-                    cell_text = str(value).replace("\r", " ").replace("\n", " ")
+                    cell_text = str(value)
                     for token in extract_address_tokens(cell_text):
                         for target in targets:
                             if not intervals_overlap(target.interval, token.interval):
                                 continue
                             coordinate = f"R{row_number}C{column_number}"
                             yield MatchRecord(
-                                workbook_path,
+                                workbook_path.relative_to(scan_root).as_posix(),
                                 target,
                                 token.raw,
                                 worksheet.title,
@@ -294,15 +297,13 @@ def scan_workbook(
                                 make_context(cell_text, token.span_start, token.span_end),
                                 cell_text,
                             )
-    finally:
-        workbook.close()
 
 
 def format_match(record: MatchRecord, verbose: bool) -> str:
     """格式化一筆純文字命中紀錄。"""
     context = record.cell_text if verbose else record.context
     return (
-        f"檔案：{record.file_path.name} | 工作表：{record.sheet} | "
+        f"檔案：{record.file_name} | 工作表：{record.sheet} | "
         f"座標：{record.coordinate} | 目標：{record.target.raw} "
         f"（第 {record.target.line_number} 行）| Token：{record.token} | 上下文：{context}"
     )
@@ -355,7 +356,7 @@ def write_match_to_csv(writer: csv.DictWriter[str], record: MatchRecord, verbose
     """將命中紀錄寫入 CSV。"""
     writer.writerow(
         {
-            "file": record.file_path.name,
+            "file": record.file_name,
             "target": record.target.raw,
             "target_line": record.target.line_number,
             "token": record.token,
@@ -399,49 +400,52 @@ def main(argv: list[str] | None = None) -> int:
 
     output_stream: TextIO | None = None
     csv_writer: csv.DictWriter[str] | None = None
+    scan_root = arguments.dir.absolute()
     try:
-        if arguments.output is not None:
-            opened_output = arguments.output.open("w", encoding="utf-8", newline="")
-            output_stream = opened_output
-            if output_format == ".csv":
-                csv_writer = write_csv_header(opened_output)
-            else:
-                opened_output.write("命中明細\n")
+        with ExitStack() as resource_stack:
+            if arguments.output is not None:
+                opened_output = resource_stack.enter_context(
+                    arguments.output.open("w", encoding="utf-8", newline="")
+                )
+                output_stream = opened_output
+                if output_format == ".csv":
+                    csv_writer = write_csv_header(opened_output)
+                else:
+                    opened_output.write("命中明細\n")
 
-        seen_matches: set[tuple[str, str, str, int, str]] = set()
-        for workbook_path in workbooks:
-            try:
-                for record in scan_workbook(workbook_path, targets, arguments.sheets):
-                    deduplication_key = (
-                        str(workbook_path.resolve()).casefold(),
-                        record.sheet,
-                        record.coordinate,
-                        record.target.line_number,
-                        record.token,
-                    )
-                    if deduplication_key in seen_matches:
-                        continue
-                    seen_matches.add(deduplication_key)
-                    summary.matches += 1
-                    if csv_writer is not None:
-                        write_match_to_csv(csv_writer, record, arguments.verbose)
-                    else:
-                        formatted_match = format_match(record, arguments.verbose)
-                        destination = output_stream if output_stream is not None else sys.stdout
-                        destination.write(f"{formatted_match}\n")
-            except WORKBOOK_READ_ERRORS as error:
-                LOGGER.warning("無法讀取活頁簿 %s，已略過：%s", workbook_path.name, error)
-                summary.partial_failure = True
+            seen_matches: set[tuple[str, str, str, int, str]] = set()
+            for workbook_path in workbooks:
+                try:
+                    for record in scan_workbook(
+                        workbook_path, scan_root, targets, arguments.sheets
+                    ):
+                        deduplication_key = (
+                            str(workbook_path.resolve()).casefold(),
+                            record.sheet,
+                            record.coordinate,
+                            record.target.line_number,
+                            record.token,
+                        )
+                        if deduplication_key in seen_matches:
+                            continue
+                        seen_matches.add(deduplication_key)
+                        summary.matches += 1
+                        if csv_writer is not None:
+                            write_match_to_csv(csv_writer, record, arguments.verbose)
+                        else:
+                            formatted_match = format_match(record, arguments.verbose)
+                            destination = output_stream if output_stream is not None else sys.stdout
+                            destination.write(f"{formatted_match}\n")
+                except WORKBOOK_READ_ERRORS as error:
+                    LOGGER.warning("無法讀取活頁簿 %s，已略過：%s", workbook_path.name, error)
+                    summary.partial_failure = True
 
-        if output_stream is not None and output_format == ".txt":
-            write_summary(output_stream, summary)
-        write_summary(sys.stdout, summary)
+            if output_stream is not None and output_format == ".txt":
+                write_summary(output_stream, summary)
+            write_summary(sys.stdout, summary)
     except OSError as error:
         LOGGER.error("無法寫入報告：%s", error)
         return 2
-    finally:
-        if output_stream is not None:
-            output_stream.close()
 
     return 1 if summary.partial_failure else 0
 

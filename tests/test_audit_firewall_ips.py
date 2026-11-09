@@ -118,6 +118,15 @@ class AuditFirewallIpsCliTests(unittest.TestCase):
         self.assertIn("第 3 行", result.stderr)
         self.assertIn("有效目標規則行數：1", result.stdout)
 
+    def test_preserves_original_target_rule_text(self) -> None:
+        self.make_workbook(self.root / "rules.xlsx", {"A1": "192.168.12.1"})
+        (self.root / "targets.txt").write_text(" 192.168.12.1 \n", encoding="utf-8")
+
+        result = self.run_cli("-d", str(self.root), "-t", str(self.root / "targets.txt"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("目標： 192.168.12.1 ", result.stdout)
+
     def test_normalizes_newlines_in_cell_text(self) -> None:
         self.make_workbook(self.root / "rules.xlsx", {"A1": "來源\r\n192.168.3.8\n備註"})
         (self.root / "targets.txt").write_text("192.168.3.8\n", encoding="utf-8")
@@ -187,6 +196,27 @@ class AuditFirewallIpsCliTests(unittest.TestCase):
         self.assertNotIn("linked-directory", result.stdout)
         self.assertIn("掃描檔案數：2", result.stdout)
 
+    def test_rejects_scan_path_with_symbolic_link_ancestor(self) -> None:
+        actual_directory = self.root / "actual"
+        nested_directory = actual_directory / "nested"
+        self.make_workbook(nested_directory / "rules.xlsx", {"A1": "192.168.4.10"})
+        linked_directory = self.root / "linked-root"
+        try:
+            linked_directory.symlink_to(actual_directory, target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"目前環境無法建立符號連結：{error}")
+        (self.root / "targets.txt").write_text("192.168.4.10\n", encoding="utf-8")
+
+        result = self.run_cli(
+            "-d",
+            str(linked_directory / "nested"),
+            "-t",
+            str(self.root / "targets.txt"),
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("符號連結", result.stderr)
+
     def test_ignores_excel_lock_files(self) -> None:
         self.make_workbook(self.root / "rules.xlsx", {"A1": "192.168.5.1"})
         (self.root / "~$open.xlsx").write_text("not an Excel workbook", encoding="utf-8")
@@ -215,6 +245,27 @@ class AuditFirewallIpsCliTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["file"], "rules.xlsx")
         self.assertEqual(rows[0]["coordinate"], "R1C1")
+
+    def test_csv_report_distinguishes_same_filename_in_different_directories(self) -> None:
+        self.make_workbook(self.root / "east" / "rules.xlsx", {"A1": "192.168.13.1"})
+        self.make_workbook(self.root / "west" / "rules.xlsx", {"A1": "192.168.13.2"})
+        (self.root / "targets.txt").write_text("192.168.13.0/24\n", encoding="utf-8")
+        output = self.root / "report.csv"
+
+        result = self.run_cli(
+            "-d",
+            str(self.root),
+            "-t",
+            str(self.root / "targets.txt"),
+            "-r",
+            "-o",
+            str(output),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with output.open(encoding="utf-8", newline="") as report_file:
+            rows = list(csv.DictReader(report_file))
+        self.assertEqual({row["file"] for row in rows}, {"east/rules.xlsx", "west/rules.xlsx"})
 
     def test_writes_text_report_with_summary_and_match_context(self) -> None:
         self.make_workbook(self.root / "rules.xlsx", {"A1": "來源 192.168.6.10-20 備註"})
@@ -253,6 +304,15 @@ class AuditFirewallIpsCliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("命中紀錄數：1", result.stdout)
+
+    def test_invalid_long_cidr_does_not_fall_back_to_single_ip(self) -> None:
+        self.make_workbook(self.root / "rules.xlsx", {"A1": "192.168.14.1/999"})
+        (self.root / "targets.txt").write_text("192.168.14.1\n", encoding="utf-8")
+
+        result = self.run_cli("-d", str(self.root), "-t", str(self.root / "targets.txt"))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("命中紀錄數：0", result.stdout)
 
     def test_invalid_workbook_is_skipped_and_returns_partial_failure(self) -> None:
         self.make_workbook(self.root / "valid.xlsx", {"A1": "192.168.9.1"})

@@ -65,3 +65,11 @@ uv remove 套件名稱
 ```
 
 uv 會同步更新 `pyproject.toml` 與 `uv.lock`。執行 Python 程式或工具時可使用 `uv run`，例如 `uv run python <程式檔>`。
+
+### 測試
+
+```powershell
+uv run pytest
+```
+
+`pytest` 僅列為開發依賴；掃描器執行期仍只依賴 `openpyxl`。

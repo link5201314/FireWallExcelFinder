@@ -86,7 +86,6 @@ class ScanSummary:
     files_scanned: int
     valid_target_lines: int
     distinct_intervals: int
-    matches: int = 0
     partial_failure: bool = False
 
 
@@ -321,7 +320,6 @@ def write_summary(stream: TextIO, summary: ScanSummary) -> None:
     stream.write(f"掃描檔案數：{summary.files_scanned}\n")
     stream.write(f"有效目標規則行數：{summary.valid_target_lines}\n")
     stream.write(f"不同位址區間數：{summary.distinct_intervals}\n")
-    stream.write(f"命中紀錄數：{summary.matches}\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -429,7 +427,6 @@ def main(argv: list[str] | None = None) -> int:
                         if deduplication_key in seen_matches:
                             continue
                         seen_matches.add(deduplication_key)
-                        summary.matches += 1
                         if csv_writer is not None:
                             write_match_to_csv(csv_writer, record, arguments.verbose)
                         else:

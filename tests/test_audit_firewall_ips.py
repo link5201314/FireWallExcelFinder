@@ -265,6 +265,9 @@ def test_writes_csv_matches_while_printing_summary_to_console(
     assert "有效目標規則行數：1" in result.stdout
     assert "rules.xlsx" not in result.stdout
     assert output.read_bytes().startswith(b"\xef\xbb\xbf")
+    assert output.read_text(encoding="utf-8-sig").splitlines()[0] == (
+        "file,sheet,coordinate,context,token,target,target_line"
+    )
     with output.open(encoding="utf-8-sig", newline="") as report_file:
         rows = list(csv.DictReader(report_file))
     assert len(rows) == 1

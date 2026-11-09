@@ -36,7 +36,15 @@ WORKBOOK_READ_ERRORS = (
     KeyError,
     ValueError,
 )
-CSV_FIELDS = ("file", "target", "target_line", "token", "sheet", "coordinate", "context")
+CSV_FIELDS = (
+    "file",
+    "sheet",
+    "coordinate",
+    "context",
+    "token",
+    "target",
+    "target_line",
+)
 
 
 @dataclass(frozen=True)

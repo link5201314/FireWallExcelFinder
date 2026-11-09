@@ -1,0 +1,10 @@
+[project]
+name = "firewall-excel-finder"
+version = "0.1.0"
+description = "大量 Excel 防火牆規則檔的查找與篩選工具"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+package = false

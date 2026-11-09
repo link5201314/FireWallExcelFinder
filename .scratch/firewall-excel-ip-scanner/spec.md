@@ -79,4 +79,4 @@
 
 - CLI 預設介面：`-d/--dir`、`-t/--target`、`-o/--output`、`-s/--sheets`、`-v/--verbose`，以及 `-r/--recursive`。報告輸出僅接受 `.txt` 與 `.csv`。
 - `read_only=True` 及逐格掃描是為降低大量活頁簿的記憶體使用；掃描時間仍取決於檔案數量、工作表大小及解壓縮成本。
-- 本規格已發佈至本地 Markdown 議題追蹤目錄。由於專案未安裝 triage 技能，本次不設定 triage 狀態或標籤。
+- 本規格與實作 tickets 以本地 Markdown 管理；triage 狀態使用專案設定的預設標籤詞彙。

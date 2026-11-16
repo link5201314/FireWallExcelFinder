@@ -11,16 +11,18 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
-
 SCRIPT = Path(__file__).resolve().parents[1] / "audit_firewall_ips.py"
 RunCli = Callable[..., subprocess.CompletedProcess[str]]
 
 
-def make_workbook(path: Path, cells: dict[str, str], sheet_name: str = "正式區") -> None:
+def make_workbook(
+    path: Path, cells: dict[str, str], sheet_name: str = "正式區"
+) -> None:
     """建立測試用活頁簿。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     worksheet = workbook.active
+    assert worksheet is not None
     worksheet.title = sheet_name
     for coordinate, value in cells.items():
         worksheet[coordinate] = value
@@ -89,10 +91,7 @@ def test_matches_cidr_and_full_or_abbreviated_ranges_by_overlap(
     )
     target_path = tmp_path / "targets.txt"
     target_path.write_text(
-        "192.168.1.20-30\n"
-        "10.0.0.4-10.0.0.8\n"
-        "10.0.0.4-8\n"
-        "192.168.1.3/24\n",
+        "192.168.1.20-30\n10.0.0.4-10.0.0.8\n10.0.0.4-8\n192.168.1.3/24\n",
         encoding="utf-8",
     )
 
@@ -111,10 +110,7 @@ def test_accepts_utf8_bom_and_skips_invalid_target_lines(
 ) -> None:
     make_workbook(tmp_path / "rules.xlsx", {"A1": "192.168.2.10"})
     target_contents = (
-        "\ufeff# 目標清單\n"
-        "999.1.1.1\n"
-        "192.168.0.250-10\n"
-        "192.168.2.10\n"
+        "\ufeff# 目標清單\n999.1.1.1\n192.168.0.250-10\n192.168.2.10\n"
     )
     target_path = tmp_path / "targets.txt"
     target_path.write_bytes(target_contents.encode("utf-8"))
@@ -128,7 +124,9 @@ def test_accepts_utf8_bom_and_skips_invalid_target_lines(
     assert "有效目標規則行數：1" in result.stdout
 
 
-def test_preserves_original_target_rule_text(tmp_path: Path, run_cli: RunCli) -> None:
+def test_preserves_original_target_rule_text(
+    tmp_path: Path, run_cli: RunCli
+) -> None:
     make_workbook(tmp_path / "rules.xlsx", {"A1": "192.168.12.1"})
     target_path = tmp_path / "targets.txt"
     target_path.write_text(" 192.168.12.1 \n", encoding="utf-8")
@@ -139,7 +137,9 @@ def test_preserves_original_target_rule_text(tmp_path: Path, run_cli: RunCli) ->
     assert "目標： 192.168.12.1 " in result.stdout
 
 
-def test_normalizes_newlines_in_cell_text(tmp_path: Path, run_cli: RunCli) -> None:
+def test_normalizes_newlines_in_cell_text(
+    tmp_path: Path, run_cli: RunCli
+) -> None:
     make_workbook(tmp_path / "rules.xlsx", {"A1": "來源\r\n192.168.3.8\n備註"})
     target_path = tmp_path / "targets.txt"
     target_path.write_text("192.168.3.8\n", encoding="utf-8")
@@ -161,6 +161,7 @@ def test_recursive_scan_and_sheet_keyword_filter(
     )
     workbook = Workbook()
     matching = workbook.active
+    assert matching is not None
     matching.title = "Production Zone"
     matching["A1"] = "192.168.4.3"
     nonmatching = workbook.create_sheet("Testing")
@@ -191,7 +192,9 @@ def test_recursive_scan_and_sheet_keyword_filter(
     assert "Testing" not in result.stdout
 
 
-def test_skips_symbolic_linked_workbooks(tmp_path: Path, run_cli: RunCli) -> None:
+def test_skips_symbolic_linked_workbooks(
+    tmp_path: Path, run_cli: RunCli
+) -> None:
     source = tmp_path / "rules.xlsx"
     make_workbook(source, {"A1": "192.168.4.9"})
     nested_directory = tmp_path / "nested"
@@ -240,7 +243,9 @@ def test_rejects_scan_path_with_symbolic_link_ancestor(
 
 def test_ignores_excel_lock_files(tmp_path: Path, run_cli: RunCli) -> None:
     make_workbook(tmp_path / "rules.xlsx", {"A1": "192.168.5.1"})
-    (tmp_path / "~$open.xlsx").write_text("not an Excel workbook", encoding="utf-8")
+    (tmp_path / "~$open.xlsx").write_text(
+        "not an Excel workbook", encoding="utf-8"
+    )
     target_path = tmp_path / "targets.txt"
     target_path.write_text("192.168.5.1\n", encoding="utf-8")
 
@@ -259,7 +264,9 @@ def test_writes_csv_matches_while_printing_summary_to_console(
     target_path.write_text("192.168.6.1\n", encoding="utf-8")
     output = tmp_path / "report.csv"
 
-    result = run_cli("-d", str(tmp_path), "-t", str(target_path), "-o", str(output))
+    result = run_cli(
+        "-d", str(tmp_path), "-t", str(target_path), "-o", str(output)
+    )
 
     assert result.returncode == 0, result.stderr
     assert "有效目標規則行數：1" in result.stdout
@@ -291,7 +298,10 @@ def test_csv_report_distinguishes_same_filename_in_different_directories(
     assert result.returncode == 0, result.stderr
     with output.open(encoding="utf-8-sig", newline="") as report_file:
         rows = list(csv.DictReader(report_file))
-    assert {row["file"] for row in rows} == {"east/rules.xlsx", "west/rules.xlsx"}
+    assert {row["file"] for row in rows} == {
+        "east/rules.xlsx",
+        "west/rules.xlsx",
+    }
 
 
 def test_writes_text_report_with_summary_and_match_context(
@@ -302,7 +312,9 @@ def test_writes_text_report_with_summary_and_match_context(
     target_path.write_text("192.168.6.15\n", encoding="utf-8")
     output = tmp_path / "report.txt"
 
-    result = run_cli("-d", str(tmp_path), "-t", str(target_path), "-o", str(output))
+    result = run_cli(
+        "-d", str(tmp_path), "-t", str(target_path), "-o", str(output)
+    )
 
     assert result.returncode == 0, result.stderr
     report = output.read_text(encoding="utf-8")
@@ -312,7 +324,9 @@ def test_writes_text_report_with_summary_and_match_context(
     assert "有效目標規則行數：1" in result.stdout
 
 
-def test_verbose_displays_full_cell_text(tmp_path: Path, run_cli: RunCli) -> None:
+def test_verbose_displays_full_cell_text(
+    tmp_path: Path, run_cli: RunCli
+) -> None:
     full_text = "前文" + ("x" * 80) + " 192.168.7.1 " + ("y" * 80) + "後文"
     make_workbook(tmp_path / "rules.xlsx", {"A1": full_text})
     target_path = tmp_path / "targets.txt"
@@ -327,7 +341,9 @@ def test_verbose_displays_full_cell_text(tmp_path: Path, run_cli: RunCli) -> Non
     assert full_text in verbose.stdout
 
 
-def test_deduplicates_same_target_token_and_cell(tmp_path: Path, run_cli: RunCli) -> None:
+def test_deduplicates_same_target_token_and_cell(
+    tmp_path: Path, run_cli: RunCli
+) -> None:
     make_workbook(tmp_path / "rules.xlsx", {"A1": "192.168.8.1；192.168.8.1"})
     target_path = tmp_path / "targets.txt"
     target_path.write_text("192.168.8.1\n", encoding="utf-8")
@@ -393,12 +409,42 @@ def test_invalid_scan_directory_returns_error_status(
     assert result.stderr
 
 
-def test_rejects_unsupported_report_extension(tmp_path: Path, run_cli: RunCli) -> None:
+def test_invalid_scan_directory_does_not_truncate_existing_report(
+    tmp_path: Path, run_cli: RunCli
+) -> None:
+    target_path = tmp_path / "targets.txt"
+    target_path.write_text("192.168.10.1\n", encoding="utf-8")
+    report_path = tmp_path / "report.txt"
+    report_path.write_text("previous complete report", encoding="utf-8")
+
+    result = run_cli(
+        "--dir",
+        str(tmp_path / "missing"),
+        "--target",
+        str(target_path),
+        "--output",
+        str(report_path),
+    )
+
+    assert result.returncode == 2
+    assert (
+        report_path.read_text(encoding="utf-8") == "previous complete report"
+    )
+
+
+def test_rejects_unsupported_report_extension(
+    tmp_path: Path, run_cli: RunCli
+) -> None:
     target_path = tmp_path / "targets.txt"
     target_path.write_text("192.168.10.1\n", encoding="utf-8")
 
     result = run_cli(
-        "-d", str(tmp_path), "-t", str(target_path), "-o", str(tmp_path / "report.json")
+        "-d",
+        str(tmp_path),
+        "-t",
+        str(target_path),
+        "-o",
+        str(tmp_path / "report.json"),
     )
 
     assert result.returncode == 2

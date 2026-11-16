@@ -7,17 +7,19 @@ import csv
 import ipaddress
 import logging
 import re
+import shutil
 import sys
+import tempfile
 import xml.etree.ElementTree as element_tree
 import zipfile
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, TextIO
+from typing import TextIO, cast
 
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
-
 
 LOGGER = logging.getLogger(__name__)
 IPV4_SOURCE = r"(?:\d{1,3}\.){3}\d{1,3}"
@@ -97,6 +99,31 @@ class ScanSummary:
     partial_failure: bool = False
 
 
+@dataclass(frozen=True)
+class TargetRuleIssue:
+    """目標清單中無法解析的來源行。"""
+
+    line_number: int
+    raw: str
+    message: str
+
+
+@dataclass
+class ScanOutcome:
+    """背景掃描的命中、摘要及狀態。"""
+
+    matches: list[MatchRecord]
+    summary: ScanSummary
+    warnings: list[str]
+    cancelled: bool = False
+    error: str | None = None
+    report_error: str | None = None
+
+
+class ScanCancelled(RuntimeError):
+    """表示報告輸出在提交前收到取消要求。"""
+
+
 class InputError(ValueError):
     """表示不可繼續的命令列輸入或輸出錯誤。"""
 
@@ -124,7 +151,9 @@ def parse_address_expression(expression: str) -> AddressInterval:
             raise ValueError(f"無效的 CIDR：{value}") from error
         if network.version != 4:
             raise ValueError("僅支援 IPv4 CIDR")
-        return AddressInterval(int(network.network_address), int(network.broadcast_address))
+        return AddressInterval(
+            int(network.network_address), int(network.broadcast_address)
+        )
 
     if "-" in value:
         if value.count("-") != 1:
@@ -138,7 +167,9 @@ def parse_address_expression(expression: str) -> AddressInterval:
                 octets = start_text.split(".")
                 if len(octets) != 4:
                     raise ValueError("簡寫範圍必須從 IPv4 位址開始")
-                end_address = ipaddress.ip_address(".".join((*octets[:3], end_text)))
+                end_address = ipaddress.ip_address(
+                    ".".join((*octets[:3], end_text))
+                )
                 if int(end_address) >> 8 != int(start_address) >> 8:
                     raise ValueError("簡寫範圍必須位於同一個 /24")
             else:
@@ -168,7 +199,23 @@ def load_target_rules(target_path: Path) -> list[TargetRule]:
     except (OSError, UnicodeError) as error:
         raise InputError(f"無法讀取目標檔 {target_path}: {error}") from error
 
+    rules, issues = parse_target_lines(lines)
+    for issue in issues:
+        LOGGER.warning(
+            "目標檔第 %s 行格式錯誤，已略過：%s（%s）",
+            issue.line_number,
+            issue.raw.strip(),
+            issue.message,
+        )
+    return rules
+
+
+def parse_target_lines(
+    lines: list[str],
+) -> tuple[list[TargetRule], list[TargetRuleIssue]]:
+    """解析目標文字行，回傳有效規則與可供介面呈現的錯誤。"""
     rules: list[TargetRule] = []
+    issues: list[TargetRuleIssue] = []
     for line_number, raw_line in enumerate(lines, start=1):
         expression = raw_line.strip()
         if not expression or expression.startswith("#"):
@@ -176,10 +223,10 @@ def load_target_rules(target_path: Path) -> list[TargetRule]:
         try:
             interval = parse_address_expression(expression)
         except ValueError as error:
-            LOGGER.warning("目標檔第 %s 行格式錯誤，已略過：%s（%s）", line_number, expression, error)
+            issues.append(TargetRuleIssue(line_number, raw_line, str(error)))
             continue
         rules.append(TargetRule(raw_line, line_number, interval))
-    return rules
+    return rules, issues
 
 
 def extract_address_tokens(cell_text: str) -> list[AddressToken]:
@@ -202,7 +249,9 @@ def extract_address_tokens(cell_text: str) -> list[AddressToken]:
                 interval = parse_address_expression(raw_token)
             except ValueError:
                 continue
-            tokens.append(AddressToken(raw_token, interval, span_start, span_end))
+            tokens.append(
+                AddressToken(raw_token, interval, span_start, span_end)
+            )
 
     tokens.sort(key=lambda token: token.span_start)
     return tokens
@@ -213,14 +262,28 @@ def intervals_overlap(first: AddressInterval, second: AddressInterval) -> bool:
     return max(first.start, second.start) <= min(first.end, second.end)
 
 
-def discover_workbooks(directory: Path, recursive: bool) -> tuple[list[Path], bool]:
-    """列出符合範圍的 Excel 活頁簿並略過符號連結。"""
+def validate_scan_directory(directory: Path) -> Path:
+    """驗證掃描目錄存在且路徑不包含符號連結。"""
     absolute_directory = directory.absolute()
-    path_components = (absolute_directory, *absolute_directory.parents)
+    path_components = (
+        component
+        for component in (absolute_directory, *absolute_directory.parents)
+        if component != Path(component.anchor)
+    )
     if any(component.is_symlink() for component in path_components):
         raise InputError(f"掃描目錄路徑不可包含符號連結：{directory}")
     if not directory.exists() or not directory.is_dir():
         raise InputError(f"掃描目錄不存在或不是目錄：{directory}")
+    return absolute_directory
+
+
+def discover_workbooks(
+    directory: Path,
+    recursive: bool,
+    warning_callback: Callable[[str], None] | None = None,
+) -> tuple[list[Path], bool]:
+    """列出符合範圍的 Excel 活頁簿並略過符號連結。"""
+    absolute_directory = validate_scan_directory(directory)
 
     root = absolute_directory
     pending_directories = [root]
@@ -230,9 +293,15 @@ def discover_workbooks(directory: Path, recursive: bool) -> tuple[list[Path], bo
     while pending_directories:
         current_directory = pending_directories.pop()
         try:
-            entries = sorted(current_directory.iterdir(), key=lambda entry: entry.name.casefold())
+            entries = sorted(
+                current_directory.iterdir(),
+                key=lambda entry: entry.name.casefold(),
+            )
         except OSError as error:
-            LOGGER.warning("無法讀取目錄 %s，已略過：%s", current_directory, error)
+            warning = f"無法讀取目錄 {current_directory}，已略過：{error}"
+            LOGGER.warning("%s", warning)
+            if warning_callback is not None:
+                warning_callback(warning)
             partial_failure = True
             continue
 
@@ -243,7 +312,10 @@ def discover_workbooks(directory: Path, recursive: bool) -> tuple[list[Path], bo
                 if recursive:
                     pending_directories.append(entry)
                 continue
-            if entry.name.startswith("~$") or entry.suffix.casefold() != ".xlsx":
+            if (
+                entry.name.startswith("~$")
+                or entry.suffix.casefold() != ".xlsx"
+            ):
                 continue
             if entry.is_file():
                 workbooks.append(entry)
@@ -252,7 +324,9 @@ def discover_workbooks(directory: Path, recursive: bool) -> tuple[list[Path], bo
     return workbooks, partial_failure
 
 
-def make_context(text: str, span_start: int, span_end: int, limit: int = 100) -> str:
+def make_context(
+    text: str, span_start: int, span_end: int, limit: int = 100
+) -> str:
     """擷取以 Token 為中心、長度受限的文字上下文。"""
     if len(text) <= limit:
         return text
@@ -279,31 +353,202 @@ def scan_workbook(
     scan_root: Path,
     targets: list[TargetRule],
     sheet_keywords: list[str] | None,
+    cancellation_requested: Callable[[], bool] | None = None,
 ) -> Iterator[MatchRecord]:
     """以唯讀模式逐格掃描活頁簿並產生命中紀錄。"""
-    with closing(load_workbook(workbook_path, read_only=True, data_only=True)) as workbook:
+    with closing(
+        load_workbook(workbook_path, read_only=True, data_only=True)
+    ) as workbook:
         for worksheet in workbook.worksheets:
             if not worksheet_matches(worksheet.title, sheet_keywords):
                 continue
-            for row_number, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+            for row_number, row in enumerate(
+                worksheet.iter_rows(values_only=True), start=1
+            ):
+                if (
+                    cancellation_requested is not None
+                    and cancellation_requested()
+                ):
+                    return
                 for column_number, value in enumerate(row, start=1):
                     if value is None:
                         continue
                     cell_text = str(value)
                     for token in extract_address_tokens(cell_text):
                         for target in targets:
-                            if not intervals_overlap(target.interval, token.interval):
+                            if not intervals_overlap(
+                                target.interval, token.interval
+                            ):
                                 continue
                             coordinate = f"R{row_number}C{column_number}"
                             yield MatchRecord(
-                                workbook_path.relative_to(scan_root).as_posix(),
+                                workbook_path.relative_to(
+                                    scan_root
+                                ).as_posix(),
                                 target,
                                 token.raw,
                                 worksheet.title,
                                 coordinate,
-                                make_context(cell_text, token.span_start, token.span_end),
+                                make_context(
+                                    cell_text, token.span_start, token.span_end
+                                ),
                                 cell_text,
                             )
+
+
+def scan_directory(
+    directory: Path,
+    targets: list[TargetRule],
+    recursive: bool = False,
+    sheet_keywords: list[str] | None = None,
+    cancellation_requested: Callable[[], bool] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    match_callback: Callable[[MatchRecord], None] | None = None,
+    collect_matches: bool = True,
+) -> ScanOutcome:
+    """掃描指定目錄，供 GUI 背景工作與其他呼叫端共用。"""
+    warnings: list[str] = []
+    workbooks, discovery_failure = discover_workbooks(
+        directory, recursive, warnings.append
+    )
+    distinct_intervals = {
+        (target.interval.start, target.interval.end) for target in targets
+    }
+    summary = ScanSummary(
+        files_scanned=len(workbooks),
+        valid_target_lines=len(targets),
+        distinct_intervals=len(distinct_intervals),
+        partial_failure=discovery_failure,
+    )
+    matches: list[MatchRecord] = []
+    seen_matches: set[tuple[str, str, str, int, str]] = set()
+    scan_root = directory.absolute()
+
+    for index, workbook_path in enumerate(workbooks, start=1):
+        if cancellation_requested is not None and cancellation_requested():
+            return ScanOutcome(matches, summary, warnings, cancelled=True)
+        if progress_callback is not None:
+            progress_callback(index - 1, len(workbooks), workbook_path.name)
+        try:
+            for record in scan_workbook(
+                workbook_path,
+                scan_root,
+                targets,
+                sheet_keywords,
+                cancellation_requested,
+            ):
+                deduplication_key = (
+                    str(workbook_path.resolve()).casefold(),
+                    record.sheet,
+                    record.coordinate,
+                    record.target.line_number,
+                    record.token,
+                )
+                if deduplication_key not in seen_matches:
+                    seen_matches.add(deduplication_key)
+                    if collect_matches:
+                        matches.append(record)
+                    if match_callback is not None:
+                        match_callback(record)
+                if (
+                    cancellation_requested is not None
+                    and cancellation_requested()
+                ):
+                    return ScanOutcome(
+                        matches, summary, warnings, cancelled=True
+                    )
+        except WORKBOOK_READ_ERRORS as error:
+            warning = f"無法讀取活頁簿 {workbook_path.name}，已略過：{error}"
+            LOGGER.warning("%s", warning)
+            warnings.append(warning)
+            summary.partial_failure = True
+        if progress_callback is not None:
+            progress_callback(index, len(workbooks), workbook_path.name)
+
+    return ScanOutcome(matches, summary, warnings)
+
+
+def write_report(
+    matches: list[MatchRecord],
+    output_path: Path,
+    verbose: bool,
+    summary: ScanSummary,
+    cancellation_requested: Callable[[], bool] | None = None,
+    warnings: list[str] | None = None,
+) -> None:
+    """先寫入同目錄暫存檔，完成後以原子替換提交報告。"""
+    suffix = output_path.suffix.casefold()
+    if suffix not in {".txt", ".csv"}:
+        raise InputError("報告副檔名僅支援 .txt 或 .csv")
+    encoding = "utf-8-sig" if suffix == ".csv" else "utf-8"
+    temporary_path: Path | None = None
+    backup_path: Path | None = None
+    report_warnings = warnings or []
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding=encoding,
+            newline="",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            if suffix == ".csv":
+                writer = write_csv_header(cast(TextIO, stream))
+                for record in matches:
+                    if (
+                        cancellation_requested is not None
+                        and cancellation_requested()
+                    ):
+                        raise ScanCancelled("報告輸出已取消")
+                    write_match_to_csv(writer, record, verbose)
+            else:
+                stream.write("命中明細\n")
+                for record in matches:
+                    if (
+                        cancellation_requested is not None
+                        and cancellation_requested()
+                    ):
+                        raise ScanCancelled("報告輸出已取消")
+                    stream.write(f"{format_match(record, verbose)}\n")
+                write_summary(cast(TextIO, stream), summary)
+                stream.write(
+                    f"部分失敗：{'是' if summary.partial_failure else '否'}\n"
+                )
+                for warning in report_warnings:
+                    stream.write(f"警告：{warning}\n")
+        if cancellation_requested is not None and cancellation_requested():
+            raise ScanCancelled("報告輸出已取消")
+        if suffix == ".csv" and output_path.exists():
+            with tempfile.NamedTemporaryFile(
+                dir=output_path.parent,
+                prefix=f".{output_path.name}.",
+                suffix=".bak",
+                delete=False,
+            ) as backup:
+                backup_path = Path(backup.name)
+            shutil.copy2(output_path, backup_path)
+        temporary_path.replace(output_path)
+        temporary_path = None
+        if suffix == ".csv":
+            try:
+                write_csv_summary(
+                    output_path, summary, len(matches), report_warnings
+                )
+            except OSError:
+                if backup_path is not None:
+                    backup_path.replace(output_path)
+                    backup_path = None
+                else:
+                    output_path.unlink(missing_ok=True)
+                raise
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        if backup_path is not None:
+            backup_path.unlink(missing_ok=True)
 
 
 def format_match(record: MatchRecord, verbose: bool) -> str:
@@ -352,13 +597,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o", "--output", type=Path, help="報告輸出路徑（僅支援 .txt 或 .csv）"
     )
-    parser.add_argument("-s", "--sheets", nargs="+", help="工作表名稱關鍵字，可指定多個")
-    parser.add_argument("-v", "--verbose", action="store_true", help="顯示命中儲存格完整文字")
-    parser.add_argument("-r", "--recursive", action="store_true", help="遞迴掃描子目錄")
+    parser.add_argument(
+        "-s", "--sheets", nargs="+", help="工作表名稱關鍵字，可指定多個"
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="顯示完整儲存格文字"
+    )
+    parser.add_argument(
+        "-r", "--recursive", action="store_true", help="遞迴掃描子目錄"
+    )
     return parser
 
 
-def write_match_to_csv(writer: csv.DictWriter[str], record: MatchRecord, verbose: bool) -> None:
+def write_match_to_csv(
+    writer: csv.DictWriter[str], record: MatchRecord, verbose: bool
+) -> None:
     """將命中紀錄寫入 CSV。"""
     writer.writerow(
         {
@@ -371,6 +624,40 @@ def write_match_to_csv(writer: csv.DictWriter[str], record: MatchRecord, verbose
             "context": record.cell_text if verbose else record.context,
         }
     )
+
+
+def write_csv_summary(
+    output_path: Path,
+    summary: ScanSummary,
+    match_count: int,
+    warnings: list[str],
+) -> None:
+    """輸出與 CSV 配對的摘要檔，保留原 CSV 欄位相容性。"""
+    summary_path = output_path.with_name(f"{output_path.name}.summary.txt")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=output_path.parent,
+            prefix=f".{summary_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            write_summary(cast(TextIO, stream), summary)
+            stream.write(f"命中數：{match_count}\n")
+            stream.write(
+                f"部分失敗：{'是' if summary.partial_failure else '否'}\n"
+            )
+            for warning in warnings:
+                stream.write(f"警告：{warning}\n")
+        temporary_path.replace(summary_path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -391,26 +678,19 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         targets = load_target_rules(arguments.target)
-        workbooks, discovery_failure = discover_workbooks(arguments.dir, arguments.recursive)
+        validate_scan_directory(arguments.dir)
     except InputError as error:
         LOGGER.error("%s", error)
         return 2
 
-    distinct_intervals = {(target.interval.start, target.interval.end) for target in targets}
-    summary = ScanSummary(
-        files_scanned=len(workbooks),
-        valid_target_lines=len(targets),
-        distinct_intervals=len(distinct_intervals),
-        partial_failure=discovery_failure,
-    )
-
     output_stream: TextIO | None = None
     csv_writer: csv.DictWriter[str] | None = None
-    scan_root = arguments.dir.absolute()
     try:
         with ExitStack() as resource_stack:
             if arguments.output is not None:
-                report_encoding = "utf-8-sig" if output_format == ".csv" else "utf-8"
+                report_encoding = (
+                    "utf-8-sig" if output_format == ".csv" else "utf-8"
+                )
                 opened_output = resource_stack.enter_context(
                     arguments.output.open(
                         "w", encoding=report_encoding, newline=""
@@ -422,35 +702,33 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     opened_output.write("命中明細\n")
 
-            seen_matches: set[tuple[str, str, str, int, str]] = set()
-            for workbook_path in workbooks:
-                try:
-                    for record in scan_workbook(
-                        workbook_path, scan_root, targets, arguments.sheets
-                    ):
-                        deduplication_key = (
-                            str(workbook_path.resolve()).casefold(),
-                            record.sheet,
-                            record.coordinate,
-                            record.target.line_number,
-                            record.token,
-                        )
-                        if deduplication_key in seen_matches:
-                            continue
-                        seen_matches.add(deduplication_key)
-                        if csv_writer is not None:
-                            write_match_to_csv(csv_writer, record, arguments.verbose)
-                        else:
-                            formatted_match = format_match(record, arguments.verbose)
-                            destination = output_stream if output_stream is not None else sys.stdout
-                            destination.write(f"{formatted_match}\n")
-                except WORKBOOK_READ_ERRORS as error:
-                    LOGGER.warning("無法讀取活頁簿 %s，已略過：%s", workbook_path.name, error)
-                    summary.partial_failure = True
+            def emit_match(record: MatchRecord) -> None:
+                """將共用掃描流程產生的命中寫至 CLI 輸出。"""
+                if csv_writer is not None:
+                    write_match_to_csv(csv_writer, record, arguments.verbose)
+                    return
+                formatted_match = format_match(record, arguments.verbose)
+                destination = (
+                    output_stream if output_stream is not None else sys.stdout
+                )
+                destination.write(f"{formatted_match}\n")
+
+            outcome = scan_directory(
+                arguments.dir,
+                targets,
+                arguments.recursive,
+                arguments.sheets,
+                match_callback=emit_match,
+                collect_matches=False,
+            )
+            summary = outcome.summary
 
             if output_stream is not None and output_format == ".txt":
                 write_summary(output_stream, summary)
             write_summary(sys.stdout, summary)
+    except InputError as error:
+        LOGGER.error("%s", error)
+        return 2
     except OSError as error:
         LOGGER.error("無法寫入報告：%s", error)
         return 2

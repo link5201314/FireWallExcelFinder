@@ -36,6 +36,29 @@ GUI 匯出 CSV 時會另外產生同名的 `.summary.txt` 摘要檔，記錄掃�
 
 CSV 報告使用帶 UTF-8 BOM 的編碼，方便在 Windows 上直接以 Excel 開啟並正確顯示中文字元。
 
+## 日誌
+
+GUI 與 CLI 共用同一套日誌設定，輸出分成兩個獨立的 sink：
+
+- **UI**：GUI 視窗底部的「日誌」分頁，以及 CLI 的 stderr。
+- **檔案**：`%LOCALAPPDATA%\FireWallExcelFinder\logs\firewall_excel_finder.log`。
+
+設定檔位於 `%LOCALAPPDATA%\FireWallExcelFinder\logging.ini`，第一次啟動時自動建立並附上繁中註解。可用的等級為 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`（不分大小寫），預設值如下：
+
+```ini
+[levels]
+ui = WARNING
+file = INFO
+```
+
+`ui` 控制 GUI 日誌分頁與 CLI stderr，`file` 控制日誌檔；兩者互相獨立，可以做到「畫面安靜、檔案詳細」。修改後需重新啟動程式才會生效。GUI 底部的「警告」分頁只顯示該次掃描的資料問題，不受 `ui` 等級影響；狀態列與進度條也不受影響。
+
+日誌檔以 UTF-8 附加寫入，每筆包含本地時間（毫秒）、等級與來源 logger，單檔上限 5 MiB，保留 3 個舊檔（現行檔加上 `.1`～`.3`）。GUI 的日誌分頁保留最近 1,000 行，並提供「清除」與「開啟日誌資料夾」。
+
+日誌不會記錄儲存格完整文字、目標規則原始行或命中 Token 的上下文。設定檔損壞、等級值非法、日誌目錄無法建立或 `%LOCALAPPDATA%` 無法使用時，程式會退回預設等級或停用檔案輸出，並在可用的輸出留下警告，不會阻止啟動、掃描或報告輸出。未捕捉例外（含背景執行緒）會以 `CRITICAL` 記錄 traceback。
+
+同時開啟多個 CLI／GUI 實例時會共用同一個日誌檔；標準輪替機制不具多程序安全性，可能遺失少量訊息或產生非預期輪替。
+
 目標規則範例：
 
 ```text

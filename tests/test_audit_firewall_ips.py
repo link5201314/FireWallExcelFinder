@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -42,6 +43,7 @@ def run_cli(tmp_path: Path) -> RunCli:
             check=False,
             text=True,
             encoding="utf-8",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
 
     return invoke

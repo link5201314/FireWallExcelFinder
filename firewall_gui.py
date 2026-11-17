@@ -6,8 +6,8 @@ import logging
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -24,12 +24,14 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from app_logging import configure_logging, detach_handler
 from audit_firewall_ips import (
     InputError,
     MatchRecord,
@@ -46,6 +48,28 @@ LOGGER = logging.getLogger(__name__)
 USER_ROLE_LINE = int(Qt.ItemDataRole.UserRole)
 USER_ROLE_RAW = USER_ROLE_LINE + 1
 USER_ROLE_VALID = USER_ROLE_LINE + 2
+LOG_LINE_LIMIT = 1000
+
+
+class LogEmitter(QObject):
+    """把日誌訊息從任意執行緒送到 Qt 主執行緒。"""
+
+    message = Signal(str)
+
+
+class QtLogHandler(logging.Handler):
+    """以 Qt signal 轉送格式化日誌訊息，不直接操作 widget。"""
+
+    def __init__(self, emitter: LogEmitter) -> None:
+        super().__init__()
+        self._emitter = emitter
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._emitter.message.emit(self.format(record))
+        except RuntimeError:
+            # 視窗已關閉，emitter 隨之刪除；忽略即可。
+            pass
 
 
 class ScanWorker(QThread):
@@ -110,9 +134,11 @@ class ScanWorker(QThread):
                     outcome.cancelled = True
                     outcome.matches.clear()
                 except (InputError, OSError) as error:
+                    LOGGER.error("無法寫入報告 %s：%s", self.report_path, error)
                     outcome.report_error = f"無法寫入報告：{error}"
             self.completed.emit(outcome)
         except (InputError, OSError) as error:
+            LOGGER.exception("掃描流程失敗")
             self.completed.emit(
                 ScanOutcome(
                     [],
@@ -148,6 +174,11 @@ class MainWindow(QMainWindow):
         self._scan_controls: list[QWidget] = []
         self._build_ui()
         self._connect_signals()
+        self._log_emitter = LogEmitter(self)
+        self._log_handler = QtLogHandler(self._log_emitter)
+        self._log_emitter.message.connect(self._append_log_message)
+        self._logging_setup = configure_logging(ui_handler=self._log_handler)
+        self._log_directory = self._logging_setup.paths.log_path.parent
         self._set_status("就緒")
 
         default_target_path = Path("targets.txt")
@@ -274,11 +305,38 @@ class MainWindow(QMainWindow):
         self.summary_label.setObjectName("summary_label")
         root_layout.addWidget(self.status_label)
         root_layout.addWidget(self.summary_label)
+        self.bottom_tabs = QTabWidget()
+        self.bottom_tabs.setObjectName("bottom_tabs")
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setObjectName("log_view")
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(LOG_LINE_LIMIT)
+        log_layout.addWidget(self.log_view)
+        log_button_row = QHBoxLayout()
+        self.clear_log_button = QPushButton("清除")
+        self.clear_log_button.setObjectName("clear_log_button")
+        self.open_log_folder_button = QPushButton("開啟日誌資料夾")
+        self.open_log_folder_button.setObjectName("open_log_folder_button")
+        log_button_row.addWidget(self.clear_log_button)
+        log_button_row.addWidget(self.open_log_folder_button)
+        log_button_row.addStretch(1)
+        log_layout.addLayout(log_button_row)
+        self.bottom_tabs.addTab(log_tab, "日誌")
+
+        warnings_tab = QWidget()
+        warnings_layout = QVBoxLayout(warnings_tab)
+        warnings_layout.setContentsMargins(0, 0, 0, 0)
         self.warnings_view = QPlainTextEdit()
         self.warnings_view.setObjectName("warnings_view")
         self.warnings_view.setReadOnly(True)
-        self.warnings_view.setMaximumHeight(80)
-        root_layout.addWidget(self.warnings_view)
+        warnings_layout.addWidget(self.warnings_view)
+        self.bottom_tabs.addTab(warnings_tab, "警告")
+        self.bottom_tabs.setCurrentIndex(0)
+        self.bottom_tabs.setMaximumHeight(160)
+        root_layout.addWidget(self.bottom_tabs)
 
         self.results_tree = QTreeWidget()
         self.results_tree.setObjectName("results_tree")
@@ -330,6 +388,18 @@ class MainWindow(QMainWindow):
         self.view_mode_combo.currentIndexChanged.connect(self._render_results)
         self.expand_all_button.clicked.connect(self.results_tree.expandAll)
         self.collapse_all_button.clicked.connect(self.results_tree.collapseAll)
+        self.clear_log_button.clicked.connect(self.log_view.clear)
+        self.open_log_folder_button.clicked.connect(self.open_log_folder)
+
+    def _append_log_message(self, message: str) -> None:
+        """在日誌分頁附加一筆訊息並捲到最新位置。"""
+        self.log_view.appendPlainText(message)
+        scrollbar = self.log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def open_log_folder(self) -> None:
+        """以系統檔案管理員開啟日誌目錄。"""
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._log_directory)))
 
     def _set_status(self, message: str) -> None:
         """更新介面狀態文字。"""
@@ -935,14 +1005,12 @@ class MainWindow(QMainWindow):
         if not self._confirm_target_edit_transition("關閉程式"):
             event.ignore()
             return
+        detach_handler(self._log_handler)
         event.accept()
 
 
 def main() -> int:
     """啟動 PySide6 桌面應用程式。"""
-    logging.basicConfig(
-        level=logging.WARNING, format="%(levelname)s: %(message)s"
-    )
     application = QApplication.instance() or QApplication([])
     window = MainWindow()
     window.show()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 from typing import TypeVar, cast
@@ -715,4 +716,190 @@ def test_gui_summary_distinguishes_full_and_selected_counts(
     assert "不同位址區間數：2" in summary
     assert "本次不同位址區間數：1" in summary
     assert "命中數：1" in summary
+    dispose_window(window)
+
+
+def write_logging_config(
+    local_app_data: Path, ui: str, file_level: str = "INFO"
+) -> None:
+    """在暫存 LOCALAPPDATA 寫入控制檔。"""
+    config_path = (
+        local_app_data / "FireWallExcelFinder" / "logging.ini"
+    )
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        f"[levels]\nui = {ui}\nfile = {file_level}\n", encoding="utf-8"
+    )
+
+
+def test_gui_log_tab_shows_debug_scan_messages(
+    qapp: QApplication,
+    tmp_path: Path,
+    isolated_local_app_data: Path,
+) -> None:
+    write_logging_config(isolated_local_app_data, "DEBUG")
+    make_workbook(tmp_path / "rules.xlsx", "192.168.10.8")
+    window = make_window(qapp, tmp_path, "192.168.10.8\n")
+    spy = QSignalSpy(window.scan_finished)
+
+    get_widget(window, QPushButton, "start_scan_button").click()
+    wait_for_scan(spy)
+
+    log_text = get_widget(window, QPlainTextEdit, "log_view").toPlainText()
+    assert "開始掃描" in log_text
+    assert "已掃描 rules.xlsx" in log_text
+    assert "掃描完成" in log_text
+    dispose_window(window)
+
+
+def test_ui_error_hides_warnings_from_log_tab_only(
+    qapp: QApplication,
+    tmp_path: Path,
+    isolated_local_app_data: Path,
+) -> None:
+    write_logging_config(isolated_local_app_data, "ERROR")
+    make_workbook(tmp_path / "valid.xlsx", "192.168.10.8")
+    (tmp_path / "broken.xlsx").write_bytes(b"not an xlsx workbook")
+    window = make_window(qapp, tmp_path, "192.168.10.8\n")
+    spy = QSignalSpy(window.scan_finished)
+
+    get_widget(window, QPushButton, "start_scan_button").click()
+    wait_for_scan(spy)
+
+    log_text = get_widget(window, QPlainTextEdit, "log_view").toPlainText()
+    warnings_text = get_widget(
+        window, QPlainTextEdit, "warnings_view"
+    ).toPlainText()
+    assert "無法讀取活頁簿" not in log_text
+    assert "broken.xlsx" in warnings_text
+    dispose_window(window)
+
+
+def test_clear_log_button_keeps_warning_tab_content(
+    qapp: QApplication,
+    tmp_path: Path,
+    isolated_local_app_data: Path,
+) -> None:
+    write_logging_config(isolated_local_app_data, "INFO")
+    make_workbook(tmp_path / "rules.xlsx", "192.168.10.8")
+    window = make_window(qapp, tmp_path, "192.168.10.8\n")
+    log_view = get_widget(window, QPlainTextEdit, "log_view")
+    warnings_view = get_widget(window, QPlainTextEdit, "warnings_view")
+    logging.getLogger("測試記錄").info("可見日誌訊息")
+    qapp.processEvents()
+    warnings_view.setPlainText("保留的警告")
+    assert "可見日誌訊息" in log_view.toPlainText()
+
+    get_widget(window, QPushButton, "clear_log_button").click()
+
+    assert log_view.toPlainText() == ""
+    assert warnings_view.toPlainText() == "保留的警告"
+    dispose_window(window)
+
+
+def test_open_log_folder_opens_expected_directory(
+    qapp: QApplication,
+    tmp_path: Path,
+    isolated_local_app_data: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[str] = []
+
+    class FakeDesktopServices:
+        @staticmethod
+        def openUrl(url: object) -> bool:
+            opened.append(url.toLocalFile())  # type: ignore[attr-defined]
+            return True
+
+    monkeypatch.setattr(
+        "firewall_gui.QDesktopServices", FakeDesktopServices
+    )
+    make_workbook(tmp_path / "rules.xlsx", "192.168.10.8")
+    window = make_window(qapp, tmp_path, "192.168.10.8\n")
+
+    get_widget(window, QPushButton, "open_log_folder_button").click()
+
+    assert [Path(path) for path in opened] == [
+        isolated_local_app_data / "FireWallExcelFinder" / "logs"
+    ]
+    dispose_window(window)
+
+
+def test_log_view_keeps_last_thousand_lines(
+    qapp: QApplication,
+    tmp_path: Path,
+    isolated_local_app_data: Path,
+) -> None:
+    write_logging_config(isolated_local_app_data, "INFO")
+    make_workbook(tmp_path / "rules.xlsx", "192.168.10.8")
+    window = make_window(qapp, tmp_path, "192.168.10.8\n")
+    log_view = get_widget(window, QPlainTextEdit, "log_view")
+    logger = logging.getLogger("測試記錄")
+
+    for index in range(1100):
+        logger.warning("訊息 %s", index)
+    qapp.processEvents()
+
+    lines = log_view.toPlainText().splitlines()
+    assert len(lines) <= 1000
+    assert lines[0].endswith("訊息 100")
+    assert lines[-1].endswith("訊息 1099")
+    dispose_window(window)
+
+
+def test_repeated_window_creation_does_not_duplicate_log_lines(
+    qapp: QApplication,
+    tmp_path: Path,
+    isolated_local_app_data: Path,
+) -> None:
+    write_logging_config(isolated_local_app_data, "WARNING")
+    make_workbook(tmp_path / "rules.xlsx", "192.168.10.8")
+    first = make_window(qapp, tmp_path, "192.168.10.8\n")
+    logging.getLogger("測試記錄").warning("重複訊息")
+    second = make_window(qapp, tmp_path, "192.168.10.8\n")
+
+    logging.getLogger("測試記錄").warning("重複訊息")
+    qapp.processEvents()
+
+    second_text = get_widget(
+        second, QPlainTextEdit, "log_view"
+    ).toPlainText()
+    assert second_text.count("重複訊息") == 1
+    dispose_window(first)
+    dispose_window(second)
+
+
+def test_closing_window_stops_ui_logging_without_error(
+    qapp: QApplication,
+    tmp_path: Path,
+    isolated_local_app_data: Path,
+) -> None:
+    write_logging_config(isolated_local_app_data, "INFO")
+    make_workbook(tmp_path / "rules.xlsx", "192.168.10.8")
+    window = make_window(qapp, tmp_path, "192.168.10.8\n")
+
+    dispose_window(window)
+    logging.getLogger("測試記錄").warning("關閉後訊息")
+    qapp.processEvents()
+
+
+def test_gui_reports_disabled_file_logging_and_still_scans(
+    qapp: QApplication,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("LOCALAPPDATA", str(blocker))
+    make_workbook(tmp_path / "rules.xlsx", "192.168.10.8")
+    window = make_window(qapp, tmp_path, "192.168.10.8\n")
+    log_view = get_widget(window, QPlainTextEdit, "log_view")
+
+    assert "已停用檔案日誌" in log_view.toPlainText()
+
+    spy = QSignalSpy(window.scan_finished)
+    get_widget(window, QPushButton, "start_scan_button").click()
+    wait_for_scan(spy)
+
+    assert "命中數：1" in get_widget(window, QLabel, "summary_label").text()
     dispose_window(window)

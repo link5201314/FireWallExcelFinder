@@ -21,6 +21,8 @@ from typing import TextIO, cast
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
+from app_logging import configure_logging
+
 LOGGER = logging.getLogger(__name__)
 IPV4_SOURCE = r"(?:\d{1,3}\.){3}\d{1,3}"
 TOKEN_PATTERNS = (
@@ -201,12 +203,11 @@ def load_target_rules(target_path: Path) -> list[TargetRule]:
 
     rules, issues = parse_target_lines(lines)
     for issue in issues:
-        LOGGER.warning(
-            "目標檔第 %s 行格式錯誤，已略過：%s（%s）",
-            issue.line_number,
-            issue.raw.strip(),
-            issue.message,
-        )
+        LOGGER.warning("目標檔第 %s 行格式錯誤，已略過", issue.line_number)
+    if issues:
+        LOGGER.info("目標檔已載入，含有 %s 行格式錯誤", len(issues))
+    else:
+        LOGGER.info("目標檔已載入：%s 條有效目標規則行", len(rules))
     return rules
 
 
@@ -407,6 +408,16 @@ def scan_directory(
     collect_matches: bool = True,
 ) -> ScanOutcome:
     """掃描指定目錄，供 GUI 背景工作與其他呼叫端共用。"""
+    sheet_description = (
+        "、".join(sheet_keywords) if sheet_keywords else "全部"
+    )
+    LOGGER.info(
+        "開始掃描：目錄=%s 遞迴=%s 工作表關鍵字=%s 選取規則數=%s",
+        directory,
+        "是" if recursive else "否",
+        sheet_description,
+        len(targets),
+    )
     warnings: list[str] = []
     workbooks, discovery_failure = discover_workbooks(
         directory, recursive, warnings.append
@@ -423,12 +434,26 @@ def scan_directory(
     matches: list[MatchRecord] = []
     seen_matches: set[tuple[str, str, str, int, str]] = set()
     scan_root = directory.absolute()
+    total_matches = 0
+
+    def log_cancelled(processed: int) -> None:
+        LOGGER.info(
+            "掃描完成：已取消 已處理=%s/%s 個檔案 命中數=%s "
+            "有效目標規則行數=%s 部分失敗=%s",
+            processed,
+            len(workbooks),
+            total_matches,
+            summary.valid_target_lines,
+            "是" if summary.partial_failure else "否",
+        )
 
     for index, workbook_path in enumerate(workbooks, start=1):
         if cancellation_requested is not None and cancellation_requested():
+            log_cancelled(index - 1)
             return ScanOutcome(matches, summary, warnings, cancelled=True)
         if progress_callback is not None:
             progress_callback(index - 1, len(workbooks), workbook_path.name)
+        file_match_count = 0
         try:
             for record in scan_workbook(
                 workbook_path,
@@ -446,6 +471,8 @@ def scan_directory(
                 )
                 if deduplication_key not in seen_matches:
                     seen_matches.add(deduplication_key)
+                    total_matches += 1
+                    file_match_count += 1
                     if collect_matches:
                         matches.append(record)
                     if match_callback is not None:
@@ -454,6 +481,7 @@ def scan_directory(
                     cancellation_requested is not None
                     and cancellation_requested()
                 ):
+                    log_cancelled(index - 1)
                     return ScanOutcome(
                         matches, summary, warnings, cancelled=True
                     )
@@ -462,9 +490,20 @@ def scan_directory(
             LOGGER.warning("%s", warning)
             warnings.append(warning)
             summary.partial_failure = True
+        LOGGER.debug(
+            "已掃描 %s：%s 筆命中", workbook_path.name, file_match_count
+        )
         if progress_callback is not None:
             progress_callback(index, len(workbooks), workbook_path.name)
 
+    LOGGER.info(
+        "掃描完成：檔案數=%s 命中數=%s 有效目標規則行數=%s "
+        "部分失敗=%s 已取消=否",
+        summary.files_scanned,
+        total_matches,
+        summary.valid_target_lines,
+        "是" if summary.partial_failure else "否",
+    )
     return ScanOutcome(matches, summary, warnings)
 
 
@@ -544,6 +583,12 @@ def write_report(
                 else:
                     output_path.unlink(missing_ok=True)
                 raise
+        LOGGER.info(
+            "已寫入%s報告：%s（%s 筆命中）",
+            "CSV" if suffix == ".csv" else "文字",
+            output_path,
+            len(matches),
+        )
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -662,11 +707,7 @@ def write_csv_summary(
 
 def main(argv: list[str] | None = None) -> int:
     """執行 CLI 掃描流程並回傳結束狀態。"""
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(levelname)s: %(message)s",
-        stream=sys.stderr,
-    )
+    configure_logging()
     parser = build_parser()
     arguments = parser.parse_args(argv)
 

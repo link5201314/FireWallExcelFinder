@@ -20,6 +20,7 @@ line-length = 79
 
 [dependency-groups]
 dev = [
+    "nuitka>=4.3.5",
     "pytest>=9.2.0",
     "ruff>=0.17.5",
     "types-openpyxl>=3.1.5.20261017",

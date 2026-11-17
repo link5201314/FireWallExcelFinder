@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QDesktopServices
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from app_logging import configure_logging, detach_handler
+from app_paths import ensure_user_data_directory, resource_path
 from audit_firewall_ips import (
     InputError,
     MatchRecord,
@@ -180,11 +181,28 @@ class MainWindow(QMainWindow):
         self._logging_setup = configure_logging(ui_handler=self._log_handler)
         self._log_directory = self._logging_setup.paths.log_path.parent
         self._set_status("就緒")
+        self._set_window_icon()
 
-        default_target_path = Path("targets.txt")
+        self._default_directory = self._resolve_default_directory()
+        default_target_path = self._default_directory / "targets.txt"
+        LOGGER.info("預設資料目錄：%s", self._default_directory)
         self.target_file_input.setText(str(default_target_path))
         if default_target_path.is_file():
             self.load_targets()
+
+    def _set_window_icon(self) -> None:
+        """套用隨程式散布的圖示；缺少檔案時沿用系統預設。"""
+        icon_path = resource_path("assets", "app.ico")
+        if icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
+    def _resolve_default_directory(self) -> Path:
+        """取得 targets.txt 與報告的預設目錄，失敗時退回目前目錄。"""
+        try:
+            return ensure_user_data_directory()
+        except OSError as error:
+            self._set_status(f"無法建立資料目錄，改用目前目錄：{error}")
+            return Path.cwd()
 
     @property
     def scan_active(self) -> bool:
@@ -482,7 +500,7 @@ class MainWindow(QMainWindow):
             selected, _ = QFileDialog.getSaveFileName(
                 self,
                 "另存目標規則檔",
-                str(Path.cwd() / "targets.txt"),
+                str(self._default_directory / "targets.txt"),
                 "文字檔 (*.txt)",
             )
             if not selected:
@@ -500,7 +518,7 @@ class MainWindow(QMainWindow):
         """將目前目標文字另存到使用者選擇的新檔案。"""
         path_text = self.target_file_input.text().strip()
         initial_path = (
-            path_text if path_text else str(Path.cwd() / "targets.txt")
+            path_text if path_text else str(self._default_directory / "targets.txt")
         )
         selected, _ = QFileDialog.getSaveFileName(
             self,
@@ -544,7 +562,7 @@ class MainWindow(QMainWindow):
         selected, _ = QFileDialog.getSaveFileName(
             self,
             "選擇報告輸出位置",
-            str(Path.cwd() / f"report{extension}"),
+            str(self._default_directory / f"report{extension}"),
             "CSV 報告 (*.csv);;文字報告 (*.txt)",
         )
         if selected:
@@ -743,7 +761,7 @@ class MainWindow(QMainWindow):
             selected, _ = QFileDialog.getSaveFileName(
                 self,
                 "選擇報告輸出位置",
-                str(Path.cwd() / f"report{extension}"),
+                str(self._default_directory / f"report{extension}"),
                 "CSV 報告 (*.csv);;文字報告 (*.txt)",
             )
             if not selected:

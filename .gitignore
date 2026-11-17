@@ -32,6 +32,11 @@ MANIFEST
 *.manifest
 *.spec
 
+# Nuitka
+*.build/
+*.dist/
+*.onefile-build/
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -176,6 +181,10 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Project reports and outputs
+report.csv
+report.csv.summary.txt
 
 # pytype static type analyzer
 .pytype/

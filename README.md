@@ -118,3 +118,104 @@ uv run pytest
 ```
 
 `pytest` 僅列為開發依賴；執行期依賴為 `openpyxl` 與 `PySide6`。GUI 測試會使用 Qt offscreen 平台，不需要顯示器。
+
+## 打包為 Windows 可攜版（Nuitka）
+
+以 Nuitka 產生 standalone 目錄，目標電腦不需要安裝 Python 或 uv，整包複製即可執行。
+
+### 前置需求
+
+- Windows 10／11 x64。目前只建置 x64，ARM64 需另外處理。
+- 第一次建置需要網路：Nuitka 會下載 MinGW64 與 ccache 到使用者快取。
+- 約 2 GB 磁碟空間；`--lto=yes` 會明顯拉長連結時間並需要較多記憶體。
+
+Python 3.13 以上不能直接使用 Nuitka 內建的 MinGW64，必須同時加上 `--mingw64` 與 `--experimental=force-mingw64`。若偏好微軟工具鏈，改安裝 Visual Studio 2022 Build Tools（勾選「Desktop development with C++」與 Windows SDK），並把這兩個旗標換成 `--msvc=latest`。
+
+所有建置指令都必須加上 `--update-check=never`。在 uv 管理的 Python 3.13 上，Nuitka 預設的更新檢查會因 OpenSSL 問題以 `OPENSSL_Uplink ... no OPENSSL_Applink` 中止，看起來像編譯失敗，實際上是檢查階段就結束。
+
+### 安裝建置工具
+
+```powershell
+uv sync
+uv add --dev nuitka
+```
+
+### 建置 GUI 版
+
+```powershell
+uv run python -m nuitka `
+  --mode=standalone `
+  --mingw64 --experimental=force-mingw64 `
+  --lto=yes --update-check=never --assume-yes-for-downloads `
+  --enable-plugin=pyside6 `
+  --windows-console-mode=disable `
+  --windows-icon-from-ico=assets\app.ico `
+  --include-data-files=assets\app.ico=assets\app.ico `
+  --output-dir=build\nuitka `
+  --output-filename=FireWallExcelFinder.exe `
+  --product-name=FireWallExcelFinder `
+  --file-version=0.1.0 --product-version=0.1.0 `
+  firewall_gui.py
+```
+
+### 建置 CLI 版
+
+```powershell
+uv run python -m nuitka `
+  --mode=standalone `
+  --mingw64 --experimental=force-mingw64 `
+  --lto=yes --update-check=never --assume-yes-for-downloads `
+  --windows-console-mode=force `
+  --windows-icon-from-ico=assets\app.ico `
+  --output-dir=build\nuitka `
+  --output-filename=FireWallExcelFinder-cli.exe `
+  --product-name=FireWallExcelFinder `
+  --file-version=0.1.0 --product-version=0.1.0 `
+  audit_firewall_ips.py
+```
+
+本次建置不處理程式簽署；正式散布前請另外以 `signtool` 簽署兩個 exe。
+```powershell
+signtool sign /n IsaacTestApp /tr http://timestamp.digicert.com /td sha256 /fd SHA256 "D:\PythonProjects\FireWallExcelFinder\build\nuitka\firewall_gui.dist\FireWallExcelFinder.exe"
+```
+```powershell
+signtool sign /n IsaacTestApp /tr http://timestamp.digicert.com /td sha256 /fd SHA256 "D:\PythonProjects\FireWallExcelFinder\build\nuitka\audit_firewall_ips.dist\FireWallExcelFinder-cli.exe"
+```
+### 輸出結構
+
+```text
+build\nuitka\
+├─ firewall_gui.dist\
+│  ├─ FireWallExcelFinder.exe
+│  ├─ assets\app.ico
+│  ├─ python313.dll
+│  ├─ PySide6\
+│  │  ├─ *.dll
+│  │  └─ qt-plugins\platforms\qwindows.dll
+│  ├─ Qt6*.dll
+│  └─ ...
+└─ audit_firewall_ips.dist\
+   ├─ FireWallExcelFinder-cli.exe
+   ├─ python313.dll
+   └─ ...
+```
+
+`*.build` 是編譯中繼檔，可刪除；`*.dist` 才是要散布的內容。
+
+### 使用方式
+
+- 將整個 `firewall_gui.dist` 或 `audit_firewall_ips.dist` 複製到目標電腦，雙擊其中的 exe。
+- 不可只複製 exe：同資料夾的 DLL、`PySide6` 與 `PySide6\qt-plugins` 都是執行必要檔案。
+- GUI 的 `targets.txt` 與報告預設寫入 `%LOCALAPPDATA%\FireWallExcelFinder`，因此程式可以放在任何位置（包含 `Program Files`），不需要系統管理員權限。
+- 第一次啟動若資料目錄沒有 `targets.txt`，GUI 會先在路徑欄位顯示預設位置；編輯規則後按「儲存」即可建立。
+- CLI 仍以目前工作目錄解析 `--dir` 與 `--target` 的相對路徑。從捷徑啟動時請傳絕對路徑，或把捷徑的「開始位置」設為要掃描的資料夾。
+- 控制檔與日誌位置不變：`%LOCALAPPDATA%\FireWallExcelFinder\logging.ini` 與 `logs\firewall_excel_finder.log`。
+
+### 注意事項
+
+- **未簽章**：Windows SmartScreen 會顯示「未知的發行者」，防毒軟體也可能誤報；簽署後才會改善。
+- **GUI 版沒有主控台輸出**：`--windows-console-mode=disable` 會關閉 console，診斷請看日誌檔或把 `logging.ini` 的 `ui` 調成 `INFO`／`DEBUG`。
+- **LTO**：`--lto=yes` 是正式產出的必要條件；若只是排查編譯問題，可暫時改成 `--lto=no`，確認無誤後再改回。
+- **整包更新**：改版時請整包替換 dist 資料夾，不要只覆蓋 exe，以免 DLL 與 Qt 外掛版本不一致。
+- **路徑長度**：解壓到較短路徑（例如 `C:\Tools\FireWallExcelFinder`）可避免 Windows 長路徑與防毒掃描造成的問題。
+- **建置機與目標機**：standalone 只保證同為 Windows x64；不要複製 `.build` 目錄，也不要期待目標機有 Python 環境。

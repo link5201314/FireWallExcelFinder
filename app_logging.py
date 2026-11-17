@@ -5,13 +5,13 @@ from __future__ import annotations
 import configparser
 import logging
 import logging.handlers
-import os
 import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-APP_DIRECTORY = "FireWallExcelFinder"
+from app_paths import APP_DIRECTORY, local_app_data_directory
+
 CONFIG_FILE_NAME = "logging.ini"
 LOG_DIRECTORY_NAME = "logs"
 LOG_FILE_NAME = "firewall_excel_finder.log"
@@ -64,14 +64,6 @@ class LoggingSetup:
     settings: LoggingSettings
     paths: LoggingPaths
     file_enabled: bool
-
-
-def local_app_data_directory() -> Path:
-    """取得使用者本地應用程式資料目錄。"""
-    value = os.environ.get("LOCALAPPDATA")
-    if value:
-        return Path(value)
-    return Path.home() / "AppData" / "Local"
 
 
 def default_paths() -> LoggingPaths:

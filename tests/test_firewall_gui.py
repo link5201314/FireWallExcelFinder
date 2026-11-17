@@ -136,6 +136,42 @@ def dispose_window(window: MainWindow) -> None:
     QApplication.processEvents()
 
 
+def test_default_target_path_uses_user_data_directory(
+    qapp: QApplication, isolated_local_app_data: Path
+) -> None:
+    window = MainWindow()
+    try:
+        expected = (
+            isolated_local_app_data / "FireWallExcelFinder" / "targets.txt"
+        )
+        target_text = get_widget(
+            window, QLineEdit, "target_file_input"
+        ).text()
+
+        assert Path(target_text) == expected
+        assert expected.parent.is_dir()
+    finally:
+        dispose_window(window)
+
+
+def test_default_target_path_falls_back_when_directory_is_unusable(
+    qapp: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("LOCALAPPDATA", str(blocker))
+
+    window = MainWindow()
+    try:
+        target_text = get_widget(
+            window, QLineEdit, "target_file_input"
+        ).text()
+
+        assert Path(target_text) == Path.cwd() / "targets.txt"
+    finally:
+        dispose_window(window)
+
+
 def test_gui_scans_and_displays_file_location_tree(
     qapp: QApplication, tmp_path: Path
 ) -> None:
